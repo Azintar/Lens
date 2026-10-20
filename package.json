@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "openapi:gen": "tsx scripts/generate-openapi.ts",
+    "openapi:check": "tsx scripts/generate-openapi.ts --check",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "changeset tag",
