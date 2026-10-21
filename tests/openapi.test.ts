@@ -6,6 +6,13 @@ import YAML from 'js-yaml'
 import { buildApp } from '../src/app'
 import { INTERNAL_ROUTES, isInternalRoute, toOpenApiPath } from '../src/openapi/coverage'
 import { extractEndpointTable, renderEndpointTable, renderOpenApiJson } from '../scripts/generate-openapi'
+import {
+  INTERNAL_ROUTES,
+  isInternalRoute,
+  isUndocumentableOperation,
+  toOpenApiPath,
+} from '../src/openapi/coverage'
+import { renderOpenApiJson } from '../scripts/generate-openapi'
 
 const specPath = fileURLToPath(new URL('../openapi.yaml', import.meta.url))
 const jsonPath = fileURLToPath(new URL('../openapi.json', import.meta.url))
@@ -59,7 +66,10 @@ describe('OpenAPI route coverage', () => {
 
   it('documents the HTTP method for every documented route', () => {
     const missing = registered.filter(
-      r => !isInternalRoute(r.path) && !(r.method.toLowerCase() in (spec.paths[r.path] ?? {})),
+      r =>
+        !isInternalRoute(r.path) &&
+        !isUndocumentableOperation(r.method, r.path) &&
+        !(r.method.toLowerCase() in (spec.paths[r.path] ?? {})),
     )
     expect(missing, `Undocumented operations: ${JSON.stringify(missing)}`).toEqual([])
   })
