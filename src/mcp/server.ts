@@ -89,6 +89,9 @@ function hostOf(url: string): string {
   }
 }
 
+export const VALID_TOOL_NAMES = ['bazaar_search', 'paid_call'] as const;
+export type ValidToolName = (typeof VALID_TOOL_NAMES)[number];
+
 export interface McpServerConfig {
   fetchWithPayment: typeof fetch;
   /**
@@ -331,13 +334,18 @@ export class BazaarMcpServer {
           name: 'bazaar_search',
           description:
             'Search for resources in a Stellar Bazaar node. The result is a bounded page: ' +
-            'check "truncated" and "total", and re-ask with limit and offset to page through the rest.',
+            'check "truncated" and "total", and re-ask with limit and offset to page through the rest. ' +
+            'Cost: free — this tool spends nothing and needs no payment key. ' +
+            'Requires a reachable HTTP or HTTPS base URL of a Bazaar catalog node; pass the root URL, not a resource path. ' +
+            'Do not use it to make a paid request (use paid_call), or to read order books or prices (use the Lens REST and GraphQL APIs).',
           inputSchema: zodToToolInputSchema(BAZAAR_SEARCH_ARGUMENTS_SCHEMA),
         },
         {
           name: 'paid_call',
           description:
             'Make a paid API call to a Bazaar resource, handling the 402 loop automatically. ' +
+            'Cost: this spends real funds from the operator key, and needs a funded signer with the right trustlines. ' +
+            'Do not use it for free discovery (use bazaar_search), and do not use it when you do not intend to spend. ' +
             (this.budget
               ? this.budget.describeLimits() + ' '
               : 'No cumulative spend ceiling is configured for this server; payments are bounded per call only. ') +
@@ -529,11 +537,6 @@ export class BazaarMcpServer {
 
           const hasResources = (d: unknown): d is { resources: unknown[] } => 
             typeof d === 'object' && d !== null && 'resources' in d && Array.isArray((d as Record<string, unknown>).resources);
-
-          if ((Array.isArray(data) && data.length === 0) || (hasResources(data) && data.resources.length === 0)) {
-            return this.createErrorResponse('ERR_NO_RESULTS', 'No resources found');
-          }
-
           return this.createBoundedResult(data, {
             maxBytes: this.limits.maxResultBytes,
             maxItems: page.limit,
@@ -681,7 +684,12 @@ export class BazaarMcpServer {
         }
       }
 
-      throw new Error(`Unknown tool: ${request.params.name}`);
+      const rawName = String(request.params.name ?? '');
+      const boundedName = rawName.slice(0, 64).replace(/[\r\n\t]/g, ' ');
+      return this.createErrorResponse(
+        'ERR_UNKNOWN_TOOL',
+        `Unknown tool '${boundedName}'. Valid tools are: ${VALID_TOOL_NAMES.join(', ')}.`
+      );
     });
   }
 

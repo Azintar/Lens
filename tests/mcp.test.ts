@@ -24,7 +24,12 @@ describe('BazaarMcpServer — server identity', () => {
 
 describe('BazaarMcpServer', () => {
   it('should map signature expiration ledger error to ERR_EXPIRED_AUTHORISATION', async () => {
-    const mockFetch = vi.fn().mockRejectedValue(new Error('Transaction signature expired. Signature expiration ledger 123 is less than current ledger 125'));
+    // What the payment client actually surfaces: @x402/fetch rethrows a scheme
+    // failure as `Failed to create payment payload: <cause>`, and the cause for a
+    // lapsed signature is the SDK's own `The transaction has expired`
+    // (@stellar/stellar-sdk lib/webauth/utils.js).
+    const expired = new Error('Failed to create payment payload: The transaction has expired');
+    const mockFetch = vi.fn().mockRejectedValue(expired);
     const server = new BazaarMcpServer({ fetchWithPayment: mockFetch, paidCallAllowlist: ['example.com'] });
 
     // The SDK server doesn't expose the router directly without a client, but we can test the handlePaidCallError method directly,
@@ -80,11 +85,15 @@ describe('BazaarMcpServer', () => {
   });
 
   it('should map 402 rejected error to ERR_PAYMENT_REJECTED', async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 402,
-      text: async () => 'Payment Required'
-    });
+    // fetchWithPayment does not throw on a rejected payment: it pays, retries,
+    // and hands back the seller's second response, so this is a real Response
+    // carrying the x402 error body rather than a hand-rolled object.
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ x402Version: 1, error: 'Payment failed: signature invalid' }),
+        { status: 402, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
     
     const server = new BazaarMcpServer({ fetchWithPayment: mockFetch, paidCallAllowlist: ['example.com'] });
 
@@ -111,11 +120,19 @@ describe('BazaarMcpServer', () => {
   });
   
   it('should return successfully on a successful call', async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ success: true, data: "hello" })
-    });
+    // A settled call is a real Response whose body is the resource's payload and
+    // whose X-PAYMENT-RESPONSE header carries the seller's settlement echo; the
+    // ledger decodes that header, so a stand-in without Headers would skip the
+    // only code path that reads it.
+    const settlement = Buffer.from(
+      JSON.stringify({ success: true, network: 'stellar:testnet' }),
+    ).toString('base64url');
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true, data: 'hello' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'X-PAYMENT-RESPONSE': settlement },
+      }),
+    );
     
     const server = new BazaarMcpServer({ fetchWithPayment: mockFetch, paidCallAllowlist: ['example.com'] });
 
@@ -139,6 +156,55 @@ describe('BazaarMcpServer', () => {
     expect(response.isError).toBeFalsy();
     const parsedText = JSON.parse(response.content[0].text);
     expect(parsedText.success).toBe(true);
+  });
+
+  it('should return structured ERR_UNKNOWN_TOOL error with valid tool names when unknown tool is called', async () => {
+    const server = new BazaarMcpServer({ fetchWithPayment: vi.fn() });
+    let handler: any = null;
+    (server as any).server.setRequestHandler = (schema: any, fn: any) => {
+      if (schema === CallToolRequestSchema) {
+        handler = fn;
+      }
+    };
+    (server as any).setupHandlers();
+
+    const response = await handler({
+      params: {
+        name: 'non_existent_tool_123',
+        arguments: {}
+      }
+    });
+
+    expect(response.isError).toBe(true);
+    const content = JSON.parse(response.content[0].text);
+    expect(content.code).toBe('ERR_UNKNOWN_TOOL');
+    expect(content.reason).toContain("Unknown tool 'non_existent_tool_123'");
+    expect(content.reason).toContain('bazaar_search, paid_call');
+  });
+
+  it('should bound and sanitize unknown tool name in error response', async () => {
+    const server = new BazaarMcpServer({ fetchWithPayment: vi.fn() });
+    let handler: any = null;
+    (server as any).server.setRequestHandler = (schema: any, fn: any) => {
+      if (schema === CallToolRequestSchema) {
+        handler = fn;
+      }
+    };
+    (server as any).setupHandlers();
+
+    const overlyLongName = 'a'.repeat(200);
+    const response = await handler({
+      params: {
+        name: overlyLongName,
+        arguments: {}
+      }
+    });
+
+    expect(response.isError).toBe(true);
+    const content = JSON.parse(response.content[0].text);
+    expect(content.code).toBe('ERR_UNKNOWN_TOOL');
+    expect(content.reason).toContain('a'.repeat(64));
+    expect(content.reason).not.toContain('a'.repeat(65));
   });
 });
 
@@ -239,6 +305,24 @@ describe('BazaarMcpServer argument validation (#411)', () => {
   }
 
   describe('advertised schema', () => {
+    it('tells the caller what each tool costs and when not to reach for it', async () => {
+      const server = new BazaarMcpServer({ paidCallAllowlist: ['example.com'] });
+      const { listHandler } = captureHandlers(server);
+      const res = await listHandler({});
+      const tools = res.tools as Array<{ name: string; description: string }>;
+
+      // A model picks a tool from its description alone. Saying bazaar_search
+      // is free and paid_call spends real funds — and naming the other tool to
+      // reach for instead — is what stops a free lookup being made as a payment.
+      const search = tools.find((t) => t.name === 'bazaar_search')
+      expect(search?.description).toContain('free')
+      expect(search?.description).toContain('paid_call')
+
+      const paid = tools.find((t) => t.name === 'paid_call')
+      expect(paid?.description).toContain('spends real funds')
+      expect(paid?.description).toContain('bazaar_search')
+    })
+
     it('advertises schemas derived from Zod definitions', async () => {
       const server = new BazaarMcpServer({ paidCallAllowlist: ['example.com'] });
       const { listHandler } = captureHandlers(server);
@@ -996,20 +1080,25 @@ describe('bazaar_search discovery routing', () => {
     expect(JSON.parse(response.content[0].text)).toEqual(body);
   });
 
-  it('maps an empty resources array to ERR_NO_RESULTS', async () => {
+  it('returns an empty resources array as a success, not an error (#414)', async () => {
+    // "I searched and there were none" is a successful search. Handed an error,
+    // an agent retries, rephrases, or reports a failure to the user — none of
+    // which is the right response to an empty set, and all of which cost a paid
+    // call. The empty collection is the answer.
     const { callTool } = searchHarness(() => jsonResponse({ resources: [] }));
 
     const response = await callTool('bazaar_search', { url: 'https://bazaar.example' });
 
-    expect(response.isError).toBe(true);
-    expect(JSON.parse(response.content[0].text)).toEqual({
-      isError: true,
-      code: MCP_ERROR_CODES.ERR_NO_RESULTS,
-      reason: 'No resources found',
-    });
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(body.resources).toEqual([]);
+    // Explicit, not merely absent: the agent can tell "none matched" from a
+    // response whose shape it did not understand.
+    expect(body.isError).toBeUndefined();
+    expect(body.code).toBeUndefined();
   });
 
-  it('maps an empty top-level array to ERR_NO_RESULTS', async () => {
+  it('returns an empty top-level array as a success, not an error (#414)', async () => {
     const { callTool } = searchHarness(() => jsonResponse([]));
 
     const response = await callTool('bazaar_search', {
@@ -1017,12 +1106,9 @@ describe('bazaar_search discovery routing', () => {
       query: 'nothing indexed yet',
     });
 
-    expect(response.isError).toBe(true);
-    expect(JSON.parse(response.content[0].text)).toEqual({
-      isError: true,
-      code: MCP_ERROR_CODES.ERR_NO_RESULTS,
-      reason: 'No resources found',
-    });
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(Array.isArray(body) ? body : body.items ?? body.resources).toEqual([]);
   });
 
   it('maps a non-2xx response to ERR_SERVICE_UNREACHABLE with the status in the reason', async () => {
@@ -1224,12 +1310,19 @@ describe('ListTools', () => {
 });
 
 describe('unknown tool', () => {
-  it('rejects instead of returning a best-effort result', async () => {
+  it('answers with a structured error carrying a code, not a raw exception', async () => {
     const { callTool } = createHarness();
 
-    // The handler throws, so the SDK surfaces this as a JSON-RPC error rather
-    // than a structured McpErrorResponse — the agent gets no error code.
-    await expect(callTool('bazaar_refund')).rejects.toThrow('Unknown tool: bazaar_refund');
+    // This asserted the opposite until #415: the handler threw, the SDK
+    // surfaced a JSON-RPC transport error, and the agent got no code to branch
+    // on. The assertion is inverted rather than deleted, because the old
+    // behaviour is precisely the bug.
+    const result = await callTool('bazaar_refund');
+
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.code).toBe('ERR_UNKNOWN_TOOL');
+    expect(payload.reason).toContain('bazaar_refund');
   });
 });
 

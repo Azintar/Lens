@@ -4,19 +4,16 @@ import { fileURLToPath } from 'node:url'
 import type { FastifyInstance, RouteOptions } from 'fastify'
 import YAML from 'js-yaml'
 import { buildApp } from '../src/app'
-import { INTERNAL_ROUTES, isInternalRoute, toOpenApiPath } from '../src/openapi/coverage'
-import { extractEndpointTable, renderEndpointTable, renderOpenApiJson } from '../scripts/generate-openapi'
 import {
   INTERNAL_ROUTES,
   isInternalRoute,
   isUndocumentableOperation,
   toOpenApiPath,
 } from '../src/openapi/coverage'
-import { renderOpenApiJson } from '../scripts/generate-openapi'
+import { checkGeneratedArtifacts, renderOpenApiJson } from '../scripts/generate-openapi'
 
 const specPath = fileURLToPath(new URL('../openapi.yaml', import.meta.url))
 const jsonPath = fileURLToPath(new URL('../openapi.json', import.meta.url))
-const readmePath = fileURLToPath(new URL('../README.md', import.meta.url))
 
 interface RegisteredRoute {
   method: string
@@ -118,24 +115,11 @@ describe('generated openapi.json', () => {
   })
 })
 
-describe('generated README endpoint table', () => {
-  it('matches the committed README', () => {
-    const readme = readFileSync(readmePath, 'utf8')
-    expect(extractEndpointTable(readme)).toBe(renderEndpointTable())
-  })
-
-  it('lists every operation in the spec exactly once', () => {
-    const readme = readFileSync(readmePath, 'utf8')
-    const rows = extractEndpointTable(readme)
-      .split('\n')
-      .filter(line => /^\| (GET|POST|PUT|PATCH|DELETE) \|/.test(line))
-
-    const specOperations = Object.entries(spec.paths).flatMap(([path, operations]) =>
-      Object.keys(operations)
-        .filter(method => method !== 'parameters')
-        .map(method => `${method.toUpperCase()} ${path}`),
-    )
-
-    expect(rows).toHaveLength(specOperations.length)
+describe('openapi:check', () => {
+  // The README endpoint table itself is rendered and asserted row-by-row in
+  // tests/readme.test.ts; this guards the single command CI runs, so editing
+  // openapi.yaml without regenerating fails here as well as in the pipeline.
+  it('reports no stale generated artifacts', async () => {
+    expect(await checkGeneratedArtifacts()).toEqual([])
   })
 })

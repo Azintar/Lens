@@ -67,6 +67,16 @@ export interface NetworkConfig {
     /** Reflector oracle contract ID for this network. */
     reflectorContractId: string
   }
+  blend: {
+    /** Whether Blend lending rate ingestion is enabled on this network. */
+    enabled: boolean
+    /** Blend pool contract addresses for this network. */
+    pools: string[]
+    /** Blend backstop contract address for this network. */
+    backstopContractId: string
+    /** How often to poll Blend pool reserves in ms. */
+    pollIntervalMs: number
+  }
   /**
    * The SEP-40 publisher — the one direction that writes. `oracle` above is
    * Lens reading somebody else's feed; this is Lens pushing its own aggregate
@@ -347,6 +357,47 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
     (process.env[`REFLECTOR_ENABLED_${suffix}`] ?? 'true').toLowerCase() !== 'false' &&
     isUsableContractId(reflectorContractId, `REFLECTOR_CONTRACT_ID_${suffix}`)
 
+  // ── Blend lending protocol ────────────────────────────────────────────────
+  const MAINNET_BLEND_POOLS = [
+    'CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD', // Fixed Pool v2
+    'CCCCIQSDILITHMM7PBSLVDT5MISSY7R26MNZXCX4H7J5JQ5FPIYOGYFS', // YieldBlox Pool v2
+    'CDVQVKOY2YSXS2IC7KN6MNASSHPAO7UN2UR2ON4OI2SKMFJNVAMDX6DP', // Fixed Pool v1
+    'CBP7NO6F7FRDHSOFQBT2L2UWYIZ2PU76JKVRYAQTG3KZSQLYAOKIF2WB', // YieldBlox Pool v1
+  ]
+  const MAINNET_BLEND_BACKSTOP = 'CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7'
+
+  const TESTNET_BLEND_POOLS = [
+    'CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF', // TestnetV2 Pool
+  ]
+  const TESTNET_BLEND_BACKSTOP = 'CBDVWXT433PRVTUNM56C3JREF3HIZHRBA64NB2C3B2UNCKIS65ZYCLZA'
+
+  const blendBackstop =
+    process.env[`BLEND_BACKSTOP_${suffix}`] ||
+    (network === 'testnet' ? process.env.BLEND_BACKSTOP : undefined) ||
+    (network === 'mainnet' ? MAINNET_BLEND_BACKSTOP : TESTNET_BLEND_BACKSTOP)
+
+  const rawBlendPools =
+    process.env[`BLEND_POOLS_${suffix}`] ||
+    (network === 'testnet' ? process.env.BLEND_POOLS : undefined)
+
+  const parsedBlendPools: string[] = rawBlendPools
+    ? rawBlendPools
+        .split(',')
+        .map(p => p.trim())
+        .filter(p => isUsableContractId(p, `BLEND_POOLS_${suffix}`))
+    : (network === 'mainnet' ? MAINNET_BLEND_POOLS : TESTNET_BLEND_POOLS)
+
+  const blendEnabled =
+    (process.env[`BLEND_ENABLED_${suffix}`] ?? (network === 'testnet' ? (process.env.BLEND_ENABLED ?? 'true') : 'true')).toLowerCase() !== 'false' &&
+    parsedBlendPools.length > 0 &&
+    isUsableContractId(blendBackstop, `BLEND_BACKSTOP_${suffix}`)
+
+  const blendPollMs = parseInt(
+    process.env[`BLEND_POLL_INTERVAL_MS_${suffix}`] ||
+    process.env.BLEND_POLL_INTERVAL_MS ||
+    '60000',
+    10
+  )
   // ── SEP-40 publisher ──────────────────────────────────────────────────────
   // Off unless a contract is deployed AND a key is provided. There is no
   // default contract id: the feed is deployed by the operator (see
@@ -446,6 +497,12 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
       poolCacheTtlMs: phoenixPoolCacheTtlMs,
     },
     oracle: { enabled: oracleEnabled, reflectorContractId },
+    blend: {
+      enabled: blendEnabled,
+      pools: parsedBlendPools,
+      backstopContractId: blendBackstop,
+      pollIntervalMs: blendPollMs,
+    },
     publisher: {
       enabled: publisherEnabled,
       contractId: sep40ContractId,
@@ -462,6 +519,8 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
 const globalConfig = {
   db: {
     url: process.env.DATABASE_URL ?? 'postgresql://lens:lens@localhost:5432/lens',
+    connectionLimit: parseInt(process.env.DB_POOL_SIZE ?? '10', 10),
+    poolTimeoutMs: parseInt(process.env.DB_POOL_TIMEOUT_MS ?? '5000', 10),
   },
   redis: {
     url: process.env.REDIS_URL ?? 'redis://localhost:6379',
@@ -511,6 +570,13 @@ const globalConfig = {
     // cheap, pollable summary, so a slightly stale copy is preferable to a
     // per-request scan, but callers must never be shown a minutes-old market.
     snapshotTtl: parseInt(process.env.SNAPSHOT_CACHE_TTL ?? '15', 10),
+    // Issue #495: how long an API-key lookup (positive OR negative) is held in
+    // the in-process auth cache before it must be re-read from Postgres. This
+    // is the worst-case window in which a key revoked on ANOTHER instance can
+    // still authenticate here — on the instance that handles the revoke,
+    // invalidation is immediate. Expiry is re-checked on every cache hit, so
+    // this TTL never extends a key past its own `expiresAt`. Keep it short.
+    apiKeyTtl: parseInt(process.env.API_KEY_CACHE_TTL ?? '30', 10),
   },
   plausibility: {
     minPrice: parseFloat(process.env.PRICE_MIN_PLAUSIBLE ?? '0.0000000001'),
@@ -518,6 +584,10 @@ const globalConfig = {
   },
   http: {
     timeoutMs: parseInt(process.env.HTTP_TIMEOUT_MS ?? '10000', 10),
+  },
+  ws: {
+    pingIntervalMs: parseInt(process.env.WS_PING_INTERVAL_MS ?? '30000', 10),
+    maxMissedPings: parseInt(process.env.WS_MAX_MISSED_PINGS ?? '2', 10),
   },
   outbound: {
     // One operator-maintained list for every outbound fetch the app makes to a
@@ -610,6 +680,7 @@ export const config = {
   get defindex() { return resolveNetwork(activeNetwork).defindex },
   get phoenix()  { return resolveNetwork(activeNetwork).phoenix },
   get oracle()   { return resolveNetwork(activeNetwork).oracle },
+  get blend()    { return resolveNetwork(activeNetwork).blend },
   get pairs()    { return resolveNetwork(activeNetwork).pairs },
   get routing()  { return resolveNetwork(activeNetwork).routing },
   get facilitator() { return resolveNetwork(activeNetwork).facilitator },
@@ -627,6 +698,7 @@ export const config = {
   cache:   globalConfig.cache,
   plausibility: globalConfig.plausibility,
   http:    globalConfig.http,
+  ws:      globalConfig.ws,
   outbound: globalConfig.outbound,
   mcp: globalConfig.mcp,
 }

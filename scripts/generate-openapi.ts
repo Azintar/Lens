@@ -6,22 +6,6 @@ const sourcePath = fileURLToPath(new URL('../openapi.yaml', import.meta.url))
 const destinationPath = fileURLToPath(new URL('../openapi.json', import.meta.url))
 const readmePath = fileURLToPath(new URL('../README.md', import.meta.url))
 
-/** Markers around the generated endpoint table in README.md. */
-export const README_TABLE_START = '<!-- BEGIN GENERATED ENDPOINT TABLE -->'
-export const README_TABLE_END = '<!-- END GENERATED ENDPOINT TABLE -->'
-
-/** HTTP methods that may appear as operations under an OpenAPI path item. */
-const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'] as const
-
-interface Operation {
-  summary?: string
-  description?: string
-}
-
-interface SpecDocument {
-  paths?: Record<string, Record<string, unknown>>
-}
-
 /**
  * Renders the committed `openapi.json` from `openapi.yaml`.
  *
@@ -40,90 +24,51 @@ export function renderOpenApiJson(yamlSource?: string): string {
   return JSON.stringify(document, null, 2) + '\n'
 }
 
-function escapeCell(value: string): string {
-  // `|` would split the markdown cell; newlines would end the row.
-  return value.replace(/\|/g, '\\|').replace(/\s*\n\s*/g, ' ').trim()
-}
-
 /**
- * Renders the REST endpoint table from `openapi.yaml`.
+ * Renders README.md with its generated sections (the REST endpoint table from
+ * `openapi.yaml`, plus the venue table) refreshed.
  *
- * One row per operation, in the order the spec declares them. Paths use the
- * OpenAPI `{param}` form — the spec is the source of truth for this table, and
- * it cannot encode the example query strings the hand-written table used. The
- * description is the operation's `summary`, falling back to `description`.
+ * The rendering itself lives in `scripts/generate-readme.ts` (`npm run
+ * readme:gen`), the single owner of the README's `<!-- ENDPOINTS:START -->`
+ * block; this wrapper only lets `openapi:gen` / `openapi:check` cover the
+ * README too, so editing the spec and running one command keeps every
+ * spec-derived artifact in step. Imported lazily because the venue table pulls
+ * in the ingest registry (and with it the Prisma client), which
+ * `renderOpenApiJson` callers do not need.
  */
-export function renderEndpointTable(yamlSource?: string): string {
-  const source = yamlSource ?? readFileSync(sourcePath, 'utf8')
-  const document = (YAML.load(source) ?? {}) as SpecDocument
-
-  const rows = ['| Method | Path | Description |', '|---|---|---|']
-  for (const [path, pathItem] of Object.entries(document.paths ?? {})) {
-    if (!pathItem || typeof pathItem !== 'object') continue
-    for (const method of HTTP_METHODS) {
-      const operation = pathItem[method] as Operation | undefined
-      if (!operation || typeof operation !== 'object') continue
-      const description = operation.summary ?? operation.description ?? ''
-      rows.push(`| ${method.toUpperCase()} | \`${path}\` | ${escapeCell(description)} |`)
-    }
-  }
-
-  return rows.join('\n')
+async function renderReadmeFromSpec(readmeSource: string): Promise<string> {
+  const { renderReadme } = await import('./generate-readme')
+  return renderReadme(readmeSource)
 }
 
-/**
- * Returns the table currently committed between the README markers.
- *
- * Throws when either marker is missing or reversed, so a mangled README fails
- * the generator loudly instead of silently appending a second table.
- */
-export function extractEndpointTable(readmeSource: string): string {
-  const start = readmeSource.indexOf(README_TABLE_START)
-  const end = readmeSource.indexOf(README_TABLE_END)
-  if (start === -1 || end === -1 || end < start) {
-    throw new Error(
-      `README.md is missing the generated endpoint table markers (${README_TABLE_START} … ${README_TABLE_END})`,
-    )
-  }
-  return readmeSource.slice(start + README_TABLE_START.length, end).trim()
+/** Normalises CRLF so a Windows checkout does not read as drift. */
+function normaliseNewlines(value: string): string {
+  return value.replace(/\r\n/g, '\n')
 }
 
-/** Replaces the README's generated table with a fresh rendering. */
-export function renderReadme(readmeSource: string, yamlSource?: string): string {
-  const table = renderEndpointTable(yamlSource)
-  extractEndpointTable(readmeSource) // validate the markers before rewriting
-  const start = readmeSource.indexOf(README_TABLE_START) + README_TABLE_START.length
-  const end = readmeSource.indexOf(README_TABLE_END)
-  return `${readmeSource.slice(0, start)}\n${table}\n${readmeSource.slice(end)}`
-}
-
-/** Regenerates `openapi.json` and the README endpoint table, in place. */
-export function generateOpenApi(): void {
+/** Regenerates `openapi.json` and the README's generated tables, in place. */
+export async function generateOpenApi(): Promise<void> {
   writeFileSync(destinationPath, renderOpenApiJson())
   const readme = readFileSync(readmePath, 'utf8')
-  writeFileSync(readmePath, renderReadme(readme))
+  writeFileSync(readmePath, await renderReadmeFromSpec(readme))
 }
 
 /**
  * Lists committed artifacts that differ from a fresh generation.
  *
  * Empty means the tree is up to date. Used by `npm run openapi:check` in CI so
- * a hand-edited spec or README fails the build instead of drifting.
+ * a hand-edited spec, JSON or README table fails the build instead of drifting.
  */
-export function checkGeneratedArtifacts(): string[] {
+export async function checkGeneratedArtifacts(): Promise<string[]> {
   const problems: string[] = []
 
-  if (renderOpenApiJson() !== readFileSync(destinationPath, 'utf8')) {
+  if (renderOpenApiJson() !== normaliseNewlines(readFileSync(destinationPath, 'utf8'))) {
     problems.push('openapi.json does not match openapi.yaml')
   }
 
-  const readme = readFileSync(readmePath, 'utf8')
-  try {
-    if (extractEndpointTable(readme) !== renderEndpointTable()) {
-      problems.push('README endpoint table does not match openapi.yaml')
-    }
-  } catch (error) {
-    problems.push(error instanceof Error ? error.message : String(error))
+  const readme = normaliseNewlines(readFileSync(readmePath, 'utf8'))
+  if ((await renderReadmeFromSpec(readme)) !== readme) {
+    problems.push('README generated tables do not match openapi.yaml / the venue registry')
   }
 
   return problems
@@ -131,9 +76,9 @@ export function checkGeneratedArtifacts(): string[] {
 
 // Run only when invoked directly (`npm run openapi:gen` / `openapi:check`),
 // not when imported by the test.
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+async function main(): Promise<void> {
   if (process.argv.includes('--check')) {
-    const problems = checkGeneratedArtifacts()
+    const problems = await checkGeneratedArtifacts()
     if (problems.length > 0) {
       console.error(`Generated API artifacts are stale:\n  - ${problems.join('\n  - ')}`)
       console.error('Run `npm run openapi:gen` and commit the result.')
@@ -141,7 +86,14 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     }
     console.log('openapi.json and the README endpoint table are up to date')
   } else {
-    generateOpenApi()
+    await generateOpenApi()
     console.log('Generated openapi.json and the README endpoint table')
   }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch(error => {
+    console.error(error)
+    process.exit(1)
+  })
 }
