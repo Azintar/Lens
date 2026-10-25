@@ -193,12 +193,105 @@ export function renderVenuesTable(adapters: VenueAdapter[] = venueAdapters): str
   return lines.join('\n')
 }
 
+interface OpenApiParameter {
+  name: string
+  in: string
+  required?: boolean
+  example?: unknown
+  style?: string
+  explode?: boolean
+  schema?: { type?: string; example?: unknown }
+}
+
+interface OpenApiDocument {
+  paths: Record<string, Record<string, any>>
+  components?: { parameters?: Record<string, OpenApiParameter> }
+}
+
+/**
+ * Resolves `$ref: '#/components/parameters/…'` entries so shared parameters
+ * (e.g. `NetworkQuery`) are judged by their real `required`/`example`.
+ * Unresolvable refs are dropped rather than guessed at.
+ */
+function resolveParameters(spec: OpenApiDocument, parameters: unknown): OpenApiParameter[] {
+  if (!Array.isArray(parameters)) return []
+  const resolved: OpenApiParameter[] = []
+  for (const p of parameters) {
+    const ref = (p as { $ref?: unknown })?.$ref
+    if (typeof ref === 'string') {
+      const match = ref.match(/^#\/components\/parameters\/(.+)$/)
+      const target = match ? spec.components?.parameters?.[match[1]] : undefined
+      if (target) resolved.push(target)
+    } else if (p && typeof p === 'object') {
+      resolved.push(p as OpenApiParameter)
+    }
+  }
+  return resolved
+}
+
+/**
+ * Encodes a query value for the README table, keeping it copy-pasteable and
+ * readable: `/`, `,` and `:` stay literal (they are legal in a query string
+ * and `pair=XLM/USDC` reads better than `pair=XLM%2FUSDC`), while anything
+ * that would break the URL or the markdown cell (`&`, `#`, spaces, `|`) is
+ * percent-encoded.
+ */
+function encodeQueryValue(value: unknown): string {
+  return encodeURIComponent(String(value))
+    .replace(/%2F/gi, '/')
+    .replace(/%2C/gi, ',')
+    .replace(/%3A/gi, ':')
+}
+
+/**
+ * Builds the worked query string for an operation from the `example:` values
+ * of its *required* query parameters, e.g. `?pair=XLM/USDC`.
+ *
+ * Optional parameters are left out on purpose: the table shows the minimum a
+ * caller must send, and every optional one has a server-side default. A
+ * required parameter with no example is also left out rather than given a
+ * placeholder, so the generator never prints a value the spec did not state.
+ * Array parameters follow OpenAPI's `form` style, which explodes by default
+ * (`asset=XLM&asset=USDC`); `explode: false` joins with commas instead.
+ */
+export function renderQueryExample(
+  pathParameters: OpenApiParameter[] = [],
+  operationParameters: OpenApiParameter[] = [],
+): string {
+  // Operation-level parameters override path-level ones with the same name+in.
+  const byKey = new Map<string, OpenApiParameter>()
+  for (const p of [...pathParameters, ...operationParameters]) {
+    if (p && typeof p === 'object' && 'name' in p) byKey.set(`${p.in}:${p.name}`, p)
+  }
+
+  const pairs: string[] = []
+  for (const p of byKey.values()) {
+    if (p.in !== 'query' || p.required !== true) continue
+    const example = p.example ?? p.schema?.example
+    if (example === undefined || example === null) continue
+
+    const name = encodeURIComponent(p.name)
+    if (Array.isArray(example)) {
+      if (example.length === 0) continue
+      if (p.explode === false) {
+        pairs.push(`${name}=${example.map(encodeQueryValue).join(',')}`)
+      } else {
+        for (const item of example) pairs.push(`${name}=${encodeQueryValue(item)}`)
+      }
+    } else {
+      pairs.push(`${name}=${encodeQueryValue(example)}`)
+    }
+  }
+
+  return pairs.length > 0 ? `?${pairs.join('&')}` : ''
+}
+
 /**
  * Renders the markdown table of REST endpoints from openapi.yaml.
  */
 export function renderEndpointsTable(specYaml?: string): string {
   const source = specYaml ?? readFileSync(openApiPath, 'utf8')
-  const spec = YAML.load(source) as { paths: Record<string, Record<string, any>> }
+  const spec = YAML.load(source) as OpenApiDocument
 
   // Ordered list of endpoints to preserve logical categorization
   const rows: EndpointDocEntry[] = []
@@ -217,7 +310,11 @@ export function renderEndpointsTable(specYaml?: string): string {
       const key = `${method} ${openApiPathKey}`
       const meta = ENDPOINT_METADATA[key]
       const defaultFastifyPath = openApiPathKey.replace(/{([A-Za-z0-9_]+)}/g, ':$1')
-      const path = meta?.displayPath ?? defaultFastifyPath
+      const queryExample = renderQueryExample(
+        resolveParameters(spec, operations.parameters),
+        resolveParameters(spec, op.parameters),
+      )
+      const path = meta?.displayPath ?? `${defaultFastifyPath}${queryExample}`
       const description = meta?.description ?? op.summary ?? op.description ?? ''
 
       rows.push({ method, path, description })

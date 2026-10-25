@@ -8,6 +8,7 @@ import {
   extractSection,
   renderVenuesTable,
   renderEndpointsTable,
+  renderQueryExample,
   renderReadme,
   readmeIsCurrent,
   VENUES_START_TAG,
@@ -143,5 +144,110 @@ describe('README venue list and endpoint table generators', () => {
     const rendered = renderReadme(initial)
     const reRendered = renderReadme(rendered)
     expect(rendered).toBe(reRendered)
+  })
+})
+
+describe('README endpoint table query-string examples', () => {
+  const spec = `
+openapi: 3.0.3
+info: { title: t, version: '1' }
+components:
+  parameters:
+    NetworkQuery:
+      name: network
+      in: query
+      required: false
+      schema: { type: string, default: testnet }
+    RequiredRef:
+      name: pair
+      in: query
+      required: true
+      example: XLM/USDC
+      schema: { type: string }
+paths:
+  /v1/needs-pair:
+    get:
+      summary: Required param with an example
+      parameters:
+        - name: pair
+          in: query
+          required: true
+          example: XLM/USDC
+          schema: { type: string }
+        - name: interval
+          in: query
+          required: false
+          example: 5m
+          schema: { type: string, default: 1m }
+        - $ref: '#/components/parameters/NetworkQuery'
+  /v1/via-ref:
+    get:
+      summary: Required param through a $ref
+      parameters:
+        - $ref: '#/components/parameters/RequiredRef'
+  /v1/array/{asset}:
+    get:
+      summary: Exploded array plus schema-level example
+      parameters:
+        - name: asset
+          in: path
+          required: true
+          example: XLM
+          schema: { type: string }
+        - name: asset
+          in: query
+          required: true
+          style: form
+          explode: true
+          example: [XLM, USDC]
+          schema: { type: array, items: { type: string } }
+        - name: ids
+          in: query
+          required: true
+          explode: false
+          schema: { type: array, items: { type: integer }, example: [1, 2] }
+  /v1/no-example:
+    get:
+      summary: Required param without an example
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema: { type: string }
+`
+
+  it('appends example values for required query parameters only', () => {
+    const table = renderEndpointsTable(spec)
+    expect(table).toContain('| GET | `/v1/needs-pair?pair=XLM/USDC` |')
+    // optional params (even with an example) and the optional NetworkQuery ref stay out
+    expect(table).not.toContain('interval=')
+    expect(table).not.toContain('network=')
+  })
+
+  it('resolves $ref parameters before deciding whether they are required', () => {
+    expect(renderEndpointsTable(spec)).toContain('| GET | `/v1/via-ref?pair=XLM/USDC` |')
+  })
+
+  it('explodes array examples by default, joins them when explode is false, and ignores path params', () => {
+    expect(renderEndpointsTable(spec)).toContain('| GET | `/v1/array/:asset?asset=XLM&asset=USDC&ids=1,2` |')
+  })
+
+  it('leaves a required parameter without an example out instead of inventing a value', () => {
+    expect(renderEndpointsTable(spec)).toContain('| GET | `/v1/no-example` |')
+  })
+
+  it('percent-encodes characters that would break the URL or the markdown cell', () => {
+    const qs = renderQueryExample([], [
+      { name: 'q', in: 'query', required: true, example: 'a b|c&d#e' },
+    ])
+    expect(qs).toBe('?q=a%20b%7Cc%26d%23e')
+  })
+
+  it('the committed README carries worked query strings for routes with required query params', () => {
+    const readmeContent = readFileSync(readmePath, 'utf8')
+    const endpointsSection = extractSection(readmeContent, ENDPOINTS_START_TAG, ENDPOINTS_END_TAG) ?? ''
+    const rowsWithQuery = endpointsSection.split('\n').filter((l) => /^\| (GET|POST) \| `[^`]*\?/.test(l))
+    expect(rowsWithQuery.length).toBeGreaterThan(0)
+    expect(endpointsSection).toContain('`/v1/basket?asset=XLM&asset=USDC&weight=0.6&weight=0.4`')
   })
 })

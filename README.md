@@ -104,7 +104,7 @@ npx @modelcontextprotocol/inspector npm run mcp:server
 | GET | `/v1/price/:assetA/:assetB/history` | Get price history buckets |
 | GET | `/v1/pools` | Get AMM liquidity pool reserves and spot prices |
 | GET | `/v1/candles/:assetA/:assetB` | Get OHLCV candle data |
-| GET | `/v1/prices/history` | Get historical 1-minute price snapshots |
+| GET | `/v1/prices/history?pair=XLM/USDC` | Get historical 1-minute price snapshots |
 | GET | `/v1/pairs` | List all active trading pairs |
 | POST | `/v1/pairs` | Add a new trading pair (Admin only) |
 | GET | `/v1/price/:assetA/:assetB/depth` | Get order-book depth and execution slippage for a pair |
@@ -121,10 +121,10 @@ npx @modelcontextprotocol/inspector npm run mcp:server
 | GET | `/v1/screener` | Screen pairs by volume, change, liquidity and price |
 | GET | `/v1/movers` | Get biggest gainers, biggest losers, and volume movers |
 | GET | `/v1/benchmark/:asset` | Get peg-deviation statistics for an asset against a target |
-| GET | `/v1/basket` | Compute the weighted price of a basket of assets |
-| GET | `/v1/correlation` | Compute price correlation matrix across a basket of assets over a window |
+| GET | `/v1/basket?asset=XLM&asset=USDC&weight=0.6&weight=0.4` | Compute the weighted price of a basket of assets |
+| GET | `/v1/correlation?assets=XLM,USDC` | Compute price correlation matrix across a basket of assets over a window |
 | GET | `/v1/discovery/resources` | Browse the x402 Bazaar catalog of discoverable resources |
-| GET | `/v1/discovery/search` | Natural language search with ranking and quality evaluation for discoverable resources |
+| GET | `/v1/discovery/search?q=USDC` | Natural language search with ranking and quality evaluation for discoverable resources |
 | POST | `/v1/webhooks` | Subscribe to a price-threshold webhook |
 | DELETE | `/v1/webhooks/:id` | Delete a webhook subscription |
 | GET | `/v1/usage/me` | Get usage and quota for the calling API key |
